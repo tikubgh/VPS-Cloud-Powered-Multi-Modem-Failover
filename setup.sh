@@ -32,6 +32,7 @@ echo "✅ Operating System detected: $OS (Version: $OS_VERSION)"
 CURRENT_SSH_PORT=$(echo $SSH_CLIENT | awk '{print $3}')
 if [ -z "$CURRENT_SSH_PORT" ]; then CURRENT_SSH_PORT=22; fi
 
+echo "=== 2. Securing Active SSH Session (Port $CURRENT_SSH_PORT) ==="
 iptables -I INPUT 1 -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 iptables -I INPUT 2 -p tcp --dport $CURRENT_SSH_PORT -j ACCEPT 2>/dev/null || true
 
@@ -57,7 +58,7 @@ fuser -k ${HTTP_PORT}/tcp >/dev/null 2>&1 || true
 sleep 2
 
 # -----------------------------------------------------------
-# AGGRESSIVE PACKAGE INSTALLATION (FORCE OVERWRITE)
+# AGGRESSIVE PACKAGE INSTALLATION
 # -----------------------------------------------------------
 if [[ "$OS" == "ubuntu" ]] || [[ "$OS" == "debian" ]] || [[ "$OS" == "openmptcprouter" ]]; then
     echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
@@ -107,7 +108,7 @@ systemctl restart shadowsocks-libev
 systemctl enable shadowsocks-libev
 
 # -----------------------------------------------------------
-# WINDOWS APP CONFIGURATION (Dynamic Wi-Fi Naming)
+# WINDOWS APP CONFIGURATION (YAML Generator)
 # -----------------------------------------------------------
 mkdir -p /opt/clash-config
 cat > /opt/clash-config/config.yaml << EOL2
@@ -208,13 +209,15 @@ rules:
 EOL2
 
 # -----------------------------------------------------------
-# ADVANCED DASHBOARD WEB SERVER (Traffic Delta Engine)
+# ULTIMATE DASHBOARD (Rebuilt Engine: Human Traffic Threshold)
 # -----------------------------------------------------------
 cat > /opt/clash-config/dashboard.py << 'EOF_PYTHON'
-import http.server, socketserver, subprocess, json, urllib.request, os
+import http.server, socketserver, subprocess, json, urllib.request, os, time, shutil
 
 PORT = 8080
 HISTORY_FILE = "isp_history.json"
+prev_cpu_stat = None
+LAST_ACTIVE_TIME = 0.0 # Force offline on startup until proven otherwise
 
 def run_cmd(cmd):
     try:
@@ -222,16 +225,77 @@ def run_cmd(cmd):
     except:
         return ""
 
-def get_new_ips():
-    out = run_cmd("netstat -tn | grep :8388 | awk '{print $5}' | cut -d: -f1")
+def get_cpu_usage():
+    global prev_cpu_stat
+    try:
+        with open("/proc/stat", "r") as f:
+            fields = [float(column) for column in f.readline().strip().split()[1:]]
+        idle_time = fields[3] + fields[4]
+        total_time = sum(fields)
+        if prev_cpu_stat is None:
+            prev_cpu_stat = (idle_time, total_time)
+            time.sleep(0.05)
+            with open("/proc/stat", "r") as f:
+                fields = [float(column) for column in f.readline().strip().split()[1:]]
+            idle_time = fields[3] + fields[4]
+            total_time = sum(fields)
+        
+        idle_delta = idle_time - prev_cpu_stat[0]
+        total_delta = total_time - prev_cpu_stat[1]
+        prev_cpu_stat = (idle_time, total_time)
+        
+        if total_delta > 0:
+            cpu_pct = 100.0 * (1.0 - idle_delta / total_delta)
+            return round(max(0.0, min(100.0, cpu_pct)), 1)
+    except:
+        pass
+    return 0.0
+
+def get_ram_usage():
+    try:
+        mem = {}
+        with open("/proc/meminfo", "r") as f:
+            for line in f:
+                parts = line.split(":")
+                if len(parts) == 2:
+                    mem[parts[0].strip()] = int(parts[1].strip().split()[0])
+        total = mem.get("MemTotal", 1)
+        avail = mem.get("MemAvailable", mem.get("MemFree", 0))
+        used = total - avail
+        pct = (used / total) * 100.0
+        used_gb = round(used / (1024 * 1024), 2)
+        total_gb = round(total / (1024 * 1024), 2)
+        return round(pct, 1), f"{used_gb} GB / {total_gb} GB"
+    except:
+        return 0.0, "0.0 GB / 0.0 GB"
+
+def get_disk_usage():
+    try:
+        total, used, free = shutil.disk_usage("/")
+        free_gb = round(free / (1024**3), 1)
+        total_gb = round(total / (1024**3), 1)
+        used_pct = round((used / total) * 100.0, 1)
+        disk_str = f"{free_gb} GB Free / {total_gb} GB Total"
+        return used_pct, disk_str
+    except:
+        return 0.0, "0 GB Free / 0 GB Total"
+
+def get_established_ips():
+    out = run_cmd("netstat -tn | grep :8388 | grep ESTABLISHED | awk '{print $5}' | cut -d: -f1")
     return list(set([ip for ip in out.split('\n') if ip and ip != "127.0.0.1" and ip != "0.0.0.0"]))
 
 def get_isp_info(ip):
     try:
-        req = urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp", timeout=2)
-        return json.loads(req.read().decode())
+        req = urllib.request.urlopen(f"http://ip-api.com/json/{ip}?fields=status,country,city,isp,org", timeout=2)
+        data = json.loads(req.read().decode())
+        if data.get("status") == "fail":
+            return "Private/Unknown", "Unknown", ""
+        isp_name = data.get("isp") or data.get("org") or "Direct Connection"
+        city = data.get("city") or "Unknown Location"
+        country = data.get("country") or ""
+        return isp_name, city, country
     except:
-        return {"isp": "Unknown ISP", "city": "Unknown", "country": "Unknown"}
+        return "Direct Connection", "Unknown Location", ""
 
 def setup_iptables_tracking(ip):
     check = run_cmd(f"iptables -nL INPUT | grep '{ip} ' || true")
@@ -268,170 +332,295 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/config.yaml':
             super().do_GET()
-        else:
-            try:
-                history = {}
-                if os.path.exists(HISTORY_FILE):
+        elif self.path == '/api/data':
+            global LAST_ACTIVE_TIME
+            current_time = time.time()
+            
+            self.send_response(200)
+            self.send_header("Content-type", "application/json")
+            self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+            self.end_headers()
+            
+            active_socket_ips = get_established_ips()
+            for ip in active_socket_ips:
+                setup_iptables_tracking(ip)
+                
+            history = {}
+            if os.path.exists(HISTORY_FILE):
+                try:
                     with open(HISTORY_FILE, "r") as f:
                         history = json.loads(f.read())
+                except:
+                    pass
+            
+            for ip in active_socket_ips:
+                if ip not in history:
+                    isp_name, city, country = get_isp_info(ip)
+                    history[ip] = {
+                        "isp_name": isp_name,
+                        "city": city,
+                        "country": country,
+                        "current_ip": ip,
+                        "last_bytes": get_raw_bytes(ip),
+                        "total_bytes": 0,
+                        "is_active": False,
+                        "is_online": True
+                    }
+                else:
+                    history[ip]["is_online"] = True
+            
+            total_delta = 0
+            max_delta = -1
+            best_ip = None
+            
+            for ip in list(history.keys()):
+                current_bytes = get_raw_bytes(ip)
+                last_bytes = history[ip].get("last_bytes", current_bytes)
+                delta = max(0, current_bytes - last_bytes)
+                total_delta += delta
                 
-                # Register any new IPs
-                new_ips = get_new_ips()
-                for ip in new_ips:
-                    if ip not in history:
-                        history[ip] = get_isp_info(ip)
-                        history[ip]["last_bytes"] = 0
-                        history[ip]["is_active"] = False
-                    setup_iptables_tracking(ip)
-
-                # Calculate True Traffic Deltas (Bytes per 5 seconds)
-                deltas = {}
-                for ip in history:
-                    current_bytes = get_raw_bytes(ip)
-                    last_bytes = history[ip].get("last_bytes", current_bytes)
-                    deltas[ip] = current_bytes - last_bytes
-                    history[ip]["last_bytes"] = current_bytes
-                    history[ip]["total_formatted"] = format_bytes(current_bytes)
-
-                # Active/Standby/Offline Logic Engine
-                max_delta = -1
-                best_ip = None
-                for ip, delta in deltas.items():
-                    if delta > max_delta:
-                        max_delta = delta
-                        best_ip = ip
+                history[ip]["last_bytes"] = current_bytes
+                history[ip]["total_bytes"] = current_bytes
+                history[ip]["total_formatted"] = format_bytes(current_bytes)
+                history[ip]["is_online"] = (ip in active_socket_ips)
                 
-                previous_active = None
+                if history[ip]["is_online"] and delta > max_delta:
+                    max_delta = delta
+                    best_ip = ip
+                    
+            # ---------------------------------------------------------
+            # THE HUMAN TRAFFIC THRESHOLD (The Core Fix)
+            # ---------------------------------------------------------
+            # Clash health checks are ~500 bytes. 
+            # If the VPS sees more than 5,000 bytes (5KB) of movement, 
+            # we confidently know TUN mode is routing REAL traffic.
+            if total_delta > 5000:
+                LAST_ACTIVE_TIME = current_time
+                
+            # If 30 seconds pass without breaching 5KB of traffic, 
+            # assume the user turned off TUN mode or went completely idle.
+            is_client_online = (current_time - LAST_ACTIVE_TIME) < 30
+            
+            if not is_client_online:
+                history = {} # Purge everything
+                if os.path.exists(HISTORY_FILE):
+                    try: os.remove(HISTORY_FILE)
+                    except: pass
+            else:
+                prev_active = None
                 for ip in history:
                     if history[ip].get("is_active"):
-                        previous_active = ip
+                        prev_active = ip
                         break
-                
-                active_ip = None
-                if max_delta < 1500: # Less than 1.5KB means it's just idle health-check pings
-                    if previous_active and deltas.get(previous_active, 0) > 0:
-                        active_ip = previous_active
-                    else:
-                        active_ip = best_ip
-                else:
-                    active_ip = best_ip
-
+                        
+                if max_delta < 5000 and prev_active and history.get(prev_active, {}).get("is_online"):
+                    best_ip = prev_active
+                elif not best_ip and len(active_socket_ips) > 0:
+                    best_ip = active_socket_ips[0]
+                    
                 for ip in history:
-                    history[ip]["is_active"] = (ip == active_ip)
-                    history[ip]["is_dead"] = (deltas.get(ip, 0) == 0) # Zero bytes = completely offline
-
+                    history[ip]["is_active"] = (ip == best_ip and history[ip]["is_online"])
+                    
                 with open(HISTORY_FILE, "w") as f:
                     f.write(json.dumps(history))
+            
+            cpu_pct = get_cpu_usage()
+            ram_pct, ram_str = get_ram_usage()
+            disk_pct, disk_str = get_disk_usage()
+            total_traffic = get_total_traffic()
 
-                traffic_gb = get_total_traffic()
+            payload = {
+                "cpu_pct": cpu_pct,
+                "ram_pct": ram_pct,
+                "ram_str": ram_str,
+                "disk_pct": disk_pct,
+                "disk_str": disk_str,
+                "total_traffic": total_traffic,
+                "is_client_online": is_client_online,
+                "isps": list(history.values())
+            }
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+        else:
+            self.send_response(200)
+            self.send_header("Content-type", "text/html; charset=utf-8")
+            self.end_headers()
+            
+            html = """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NexusWAN Sentinel Live Telemetry</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0B0F19; color: #F1F5F9; height: 100vh; overflow: hidden; display: flex; flex-direction: column; }
+        
+        .app-container { height: 100vh; max-width: 1400px; width: 100%; margin: 0 auto; padding: 16px 20px; display: flex; flex-direction: column; gap: 12px; }
+        
+        .header { display: flex; justify-content: space-between; align-items: center; padding-bottom: 8px; border-bottom: 1px solid #1E293B; }
+        .header h1 { font-size: 20px; font-weight: 700; color: #38BDF8; letter-spacing: 0.5px; }
+        .header-status { font-size: 13px; font-weight: 600; padding: 4px 10px; border-radius: 6px; }
+        .hs-connected { background: rgba(16, 185, 129, 0.15); color: #34D399; border: 1px solid #10B981; }
+        .hs-disconnected { background: rgba(239, 68, 68, 0.15); color: #F87171; border: 1px solid #EF4444; }
 
-                # Build HTML UI
-                html = f"""
-                <!DOCTYPE html>
-                <html lang="en">
-                <head>
-                    <meta charset="UTF-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <title>Multi-WAN Failover Dashboard</title>
-                    <meta http-equiv="refresh" content="5">
-                    <style>
-                        body {{ font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif; background: #0F172A; color: #F8FAFC; padding: 20px; margin: 0; }}
-                        .header {{ text-align: center; margin-bottom: 30px; border-bottom: 1px solid #334155; padding-bottom: 20px; }}
-                        .header h1 {{ color: #38BDF8; font-size: 28px; font-weight: 600; margin: 0; text-transform: uppercase; letter-spacing: 1px; }}
-                        .container {{ max-width: 900px; margin: auto; }}
-                        .grid {{ display: grid; grid-template-columns: 1fr; gap: 20px; }}
-                        
-                        .card {{ background: #1E293B; border-radius: 12px; padding: 24px; position: relative; border-left: 8px solid #475569; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.5); }}
-                        .card.active {{ border-left-color: #10B981; box-shadow: 0 0 20px rgba(16, 185, 129, 0.2); }}
-                        .card.offline {{ border-left-color: #EF4444; opacity: 0.7; }}
-                        
-                        .traffic-card {{ background: linear-gradient(145deg, #1E293B, #0F172A); border-left: 8px solid #38BDF8; text-align: center; padding: 30px; }}
-                        .traffic-card h2 {{ margin: 10px 0 0 0; color: #38BDF8; font-size: 42px; font-weight: 700; }}
-                        .traffic-card p {{ margin: 0; color: #94A3B8; font-size: 16px; text-transform: uppercase; letter-spacing: 1px; }}
+        .metrics-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+        .m-card { background: #131C2E; border-radius: 10px; padding: 12px 14px; border: 1px solid #1E293B; }
+        .m-title { font-size: 11px; font-weight: 700; text-transform: uppercase; color: #94A3B8; letter-spacing: 0.5px; }
+        .m-val-row { display: flex; justify-content: space-between; align-items: baseline; margin: 4px 0 6px 0; }
+        .m-val { font-size: 20px; font-weight: 800; font-family: monospace; color: #F8FAFC; }
+        .m-sub { font-size: 11px; color: #64748B; font-family: monospace; }
+        .p-bg { background: #0B0F19; height: 6px; border-radius: 3px; overflow: hidden; }
+        .p-fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
+        .f-cpu { background: #38BDF8; }
+        .f-ram { background: #A855F7; }
+        .f-disk { background: #EC4899; }
+        .f-traffic { background: #10B981; }
 
-                        .badge {{ position: absolute; top: 24px; right: 24px; padding: 6px 12px; border-radius: 20px; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }}
-                        .badge-active {{ background: rgba(16, 185, 129, 0.2); color: #10B981; border: 1px solid #10B981; }}
-                        .badge-standby {{ background: rgba(245, 158, 11, 0.2); color: #F59E0B; border: 1px solid #F59E0B; }}
-                        .badge-offline {{ background: rgba(239, 68, 68, 0.2); color: #EF4444; border: 1px solid #EF4444; }}
-                        
-                        .isp-title {{ font-size: 22px; font-weight: 600; color: #F1F5F9; margin: 0 0 15px 0; padding-right: 100px; }}
-                        
-                        .data-row {{ display: flex; justify-content: space-between; align-items: center; background: #0F172A; padding: 12px 16px; border-radius: 8px; margin-bottom: 8px; }}
-                        .data-label {{ color: #94A3B8; font-size: 14px; }}
-                        .data-value {{ color: #F8FAFC; font-weight: 500; font-family: monospace; font-size: 15px; }}
-                        .highlight-data {{ color: #38BDF8; font-weight: 700; font-size: 18px; }}
-                    </style>
-                </head>
-                <body>
-                    <div class="container">
-                        <div class="header">
-                            <h1>Network Failover Status</h1>
+        .isp-section { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+        .isp-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 12px; height: 100%; overflow-y: auto; align-content: start; }
+        
+        .isp-card { background: #131C2E; border-radius: 10px; padding: 14px 16px; border: 1px solid #1E293B; border-left: 6px solid #475569; position: relative; display: flex; flex-direction: column; justify-content: space-between; }
+        .isp-card.active { border-left-color: #10B981; box-shadow: 0 0 15px rgba(16, 185, 129, 0.15); }
+        .isp-card.standby { border-left-color: #F59E0B; }
+        
+        .card-head { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 10px; }
+        .isp-name { font-size: 16px; font-weight: 700; color: #F8FAFC; }
+        .badge { padding: 3px 8px; border-radius: 12px; font-size: 10px; font-weight: 800; text-transform: uppercase; }
+        .b-active { background: rgba(16, 185, 129, 0.2); color: #10B981; border: 1px solid #10B981; }
+        .b-standby { background: rgba(245, 158, 11, 0.2); color: #F59E0B; border: 1px solid #F59E0B; }
+        
+        .d-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; font-size: 12px; margin-bottom: 8px; }
+        .d-box { background: #0B0F19; padding: 6px 10px; border-radius: 6px; }
+        .d-lbl { color: #64748B; font-size: 10px; text-transform: uppercase; }
+        .d-txt { color: #F1F5F9; font-weight: 600; font-family: monospace; }
+        .highlight { color: #38BDF8; font-weight: 700; }
+
+        .empty-state { height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center; background: #131C2E; border: 1px dashed #334155; border-radius: 10px; text-align: center; padding: 20px; }
+        .empty-state svg { width: 54px; height: 54px; color: #F87171; margin-bottom: 16px; }
+        .empty-state h3 { font-size: 24px; color: #F87171; margin-bottom: 8px; font-weight: 800; letter-spacing: 1px; }
+        .empty-state p { font-size: 14px; color: #94A3B8; max-width: 450px; line-height: 1.5; }
+    </style>
+</head>
+<body>
+    <div class="app-container">
+        <div class="header">
+            <h1>NexusWAN Sentinel Dashboard</h1>
+            <div id="status-badge" class="header-status hs-disconnected">INITIALIZING...</div>
+        </div>
+
+        <div class="metrics-row">
+            <div class="m-card">
+                <div class="m-title">VPS CPU Load</div>
+                <div class="m-val-row"><span id="cpu-val" class="m-val">0.0%</span><span class="m-sub">Live</span></div>
+                <div class="p-bg"><div id="cpu-bar" class="p-fill f-cpu" style="width: 0%;"></div></div>
+            </div>
+            <div class="m-card">
+                <div class="m-title">RAM Usage</div>
+                <div class="m-val-row"><span id="ram-val" class="m-val">0.0%</span><span id="ram-sub" class="m-sub">--</span></div>
+                <div class="p-bg"><div id="ram-bar" class="p-fill f-ram" style="width: 0%;"></div></div>
+            </div>
+            <div class="m-card">
+                <div class="m-title">Disk Storage</div>
+                <div class="m-val-row"><span id="disk-val" class="m-val">0.0%</span><span id="disk-sub" class="m-sub">--</span></div>
+                <div class="p-bg"><div id="disk-bar" class="p-fill f-disk" style="width: 0%;"></div></div>
+            </div>
+            <div class="m-card">
+                <div class="m-title">Total VPS Bandwidth</div>
+                <div class="m-val-row"><span id="traffic-val" class="m-val">0.0 GB</span><span class="m-sub">In / Out</span></div>
+                <div class="p-bg"><div class="p-fill f-traffic" style="width: 100%;"></div></div>
+            </div>
+        </div>
+
+        <div class="isp-section">
+            <div id="isp-container" class="isp-grid"></div>
+        </div>
+    </div>
+
+    <script>
+        async function fetchTelemetry() {
+            try {
+                const res = await fetch('/api/data', { cache: 'no-store' });
+                const d = await res.json();
+
+                document.getElementById('cpu-val').innerText = d.cpu_pct + '%';
+                document.getElementById('cpu-bar').style.width = Math.min(d.cpu_pct, 100) + '%';
+
+                document.getElementById('ram-val').innerText = d.ram_pct + '%';
+                document.getElementById('ram-sub').innerText = d.ram_str;
+                document.getElementById('ram-bar').style.width = Math.min(d.ram_pct, 100) + '%';
+
+                document.getElementById('disk-val').innerText = d.disk_pct + '%';
+                document.getElementById('disk-sub').innerText = d.disk_str;
+                document.getElementById('disk-bar').style.width = Math.min(d.disk_pct, 100) + '%';
+
+                document.getElementById('traffic-val').innerText = d.total_traffic + ' GB';
+
+                const sb = document.getElementById('status-badge');
+                if (d.is_client_online) {
+                    sb.className = 'header-status hs-connected';
+                    sb.innerText = '● CLIENT CONNECTED (TUN ACTIVE)';
+                } else {
+                    sb.className = 'header-status hs-disconnected';
+                    sb.innerText = '● NO CONNECTION TO PC (TUN OFF / IDLE)';
+                }
+
+                const container = document.getElementById('isp-container');
+                if (!d.is_client_online || !d.isps || d.isps.length === 0) {
+                    container.innerHTML = `
+                        <div class="empty-state">
+                            <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M18.364 5.636a9 9 0 010 12.728m0 0l-2.829-2.829m2.829 2.829L21 21M15.536 8.464a5 5 0 010 7.072m0 0l-2.829-2.829m-4.243 2.829a4.978 4.978 0 01-1.414-2.83m-1.414 5.658a9 9 0 01-2.167-9.238m7.824 2.167a1 1 0 111.414 1.414m-1.414-1.414L3 3m8.293 8.293l1.414 1.414"></path></svg>
+                            <h3>ALL CONNECTIONS OFF</h3>
+                            <p>System is in Standby Mode. Turn ON <b>TUN Mode</b> in your local client to restore encrypted routing.</p>
                         </div>
-                        <div class="card traffic-card" style="margin-bottom: 30px;">
-                            <p>Total Server Bandwidth Processed</p>
-                            <h2>{traffic_gb} GB</h2>
-                        </div>
-                        <div class="grid">
-                """
+                    `;
+                    return;
+                }
 
-                if not history:
-                    html += "<div class='card'><div class='isp-title'>Waiting for Windows PC to connect...</div></div>"
-                
-                isp_counter = 1
-                for ip, info in history.items():
-                    if info.get("is_active"):
-                        card_class = "card active"
-                        badge_class = "badge badge-active"
-                        status_text = "● ACTIVE NOW"
-                    elif info.get("is_dead"):
-                        card_class = "card offline"
-                        badge_class = "badge badge-offline"
-                        status_text = "● OFFLINE"
-                    else:
-                        card_class = "card"
-                        badge_class = "badge badge-standby"
-                        status_text = "● STANDBY"
-                    
-                    isp_name = info.get("isp", "Unknown ISP")
-                    city = info.get("city", "Unknown")
-                    country = info.get("country", "")
-                    location = f"{city}, {country}".strip(", ")
-                    isp_traffic = info.get("total_formatted", "0.00 MB")
-                    
-                    html += f"""
-                            <div class="{card_class}">
-                                <div class="{badge_class}">{status_text}</div>
-                                <div class="isp-title">ISP {isp_counter}: {isp_name}</div>
-                                <div class="data-row">
-                                    <span class="data-label">External IP Address</span>
-                                    <span class="data-value">{ip}</span>
+                let cardsHtml = '';
+                d.isps.forEach((isp, idx) => {
+                    const isActive = isp.is_active;
+                    const cardClass = isActive ? 'isp-card active' : 'isp-card standby';
+                    const badgeClass = isActive ? 'badge b-active' : 'badge b-standby';
+                    const badgeText = isActive ? '● ACTIVE NOW' : '● STANDBY';
+
+                    cardsHtml += `
+                        <div class="${cardClass}">
+                            <div>
+                                <div class="card-head">
+                                    <div class="isp-name">ISP ${idx + 1}: ${isp.isp_name}</div>
+                                    <span class="${badgeClass}">${badgeText}</span>
                                 </div>
-                                <div class="data-row">
-                                    <span class="data-label">Physical Location</span>
-                                    <span class="data-value">{location}</span>
-                                </div>
-                                <div class="data-row">
-                                    <span class="data-label">Data Consumed by this ISP</span>
-                                    <span class="data-value highlight-data">{isp_traffic}</span>
+                                <div class="d-grid">
+                                    <div class="d-box">
+                                        <div class="d-lbl">Active IP</div>
+                                        <div class="d-txt">${isp.current_ip}</div>
+                                    </div>
+                                    <div class="d-box">
+                                        <div class="d-lbl">Location</div>
+                                        <div class="d-txt">${isp.city || 'Unknown'}, ${isp.country || ''}</div>
+                                    </div>
+                                    <div class="d-box" style="grid-column: span 2;">
+                                        <div class="d-lbl">Data Processed by ISP</div>
+                                        <div class="d-txt highlight">${isp.total_formatted || '0.00 MB'}</div>
+                                    </div>
                                 </div>
                             </div>
-                    """
-                    isp_counter += 1
-
-                html += """
                         </div>
-                    </div>
-                </body>
-                </html>
-                """
-                self.send_response(200)
-                self.send_header("Content-type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(html.encode("utf-8"))
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(str(e).encode("utf-8"))
+                    `;
+                });
+                container.innerHTML = cardsHtml;
+            } catch (err) {
+                console.error("Telemetry fetch error:", err);
+            }
+        }
+
+        fetchTelemetry();
+        setInterval(fetchTelemetry, 2000);
+    </script>
+</body>
+</html>
+"""
+            self.wfile.write(html.encode("utf-8"))
 
 socketserver.TCPServer.allow_reuse_address = True
 httpd = socketserver.TCPServer(("", PORT), DashboardHandler)
@@ -475,12 +664,21 @@ elif [[ "$OS" == "centos" ]] || [[ "$OS" == "almalinux" ]] || [[ "$OS" == "rocky
 fi
 
 echo ""
-echo "=========================================================="
-echo "✅ Installation Completed! (Traffic-Aware Dashboard Live)"
-echo "=========================================================="
-echo "👉 Your Windows Setup URL (Paste into Clash Verge Rev):"
-echo "http://${SERVER_IP}:${HTTP_PORT}/config.yaml"
-echo "=========================================================="
+echo "=========================================================================="
+echo "✅ NEXUSWAN SENTINEL DEPLOYED & CONFIGURED SUCCESSFULLY!"
+echo "=========================================================================="
+echo "Architecture Detected : $SYSTEM_ARCH"
+echo "Operating System      : $OS $OS_VERSION"
+echo "Server Public IPv4    : $SERVER_IP"
+echo "Shadowsocks Port      : $SS_PORT"
+echo "Dashboard Port        : $HTTP_PORT"
+echo "=========================================================================="
+echo "👉 1. CLIENT SUBSCRIPTION URL (Import into Clash Verge Rev):"
+echo "   http://${SERVER_IP}:${HTTP_PORT}/config.yaml"
+echo ""
+echo "👉 2. LIVE TELEMETRY DASHBOARD (Open in Any Browser):"
+echo "   http://${SERVER_IP}:${HTTP_PORT}/"
+echo "=========================================================================="
 echo ""
 EOF
 
