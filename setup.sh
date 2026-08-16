@@ -209,7 +209,7 @@ rules:
 EOL2
 
 # -----------------------------------------------------------
-# ULTIMATE DASHBOARD (Rebuilt Engine: Human Traffic Threshold)
+# ULTIMATE DASHBOARD (With Real-Time Speed Engine)
 # -----------------------------------------------------------
 cat > /opt/clash-config/dashboard.py << 'EOF_PYTHON'
 import http.server, socketserver, subprocess, json, urllib.request, os, time, shutil
@@ -217,7 +217,12 @@ import http.server, socketserver, subprocess, json, urllib.request, os, time, sh
 PORT = 8080
 HISTORY_FILE = "isp_history.json"
 prev_cpu_stat = None
-LAST_ACTIVE_TIME = 0.0 # Force offline on startup until proven otherwise
+LAST_ACTIVE_TIME = 0.0
+
+# Speed tracking variables
+LAST_NET_TIME = time.time()
+LAST_RX = 0
+LAST_TX = 0
 
 def run_cmd(cmd):
     try:
@@ -319,21 +324,29 @@ def format_bytes(b):
         return f"{round(mb / 1024, 2)} GB"
     return f"{round(mb, 2)} MB"
 
-def get_total_traffic():
+def get_net_stats():
     try:
         iface = run_cmd("ip route get 8.8.8.8 | grep dev | awk -F'dev' '{print $2}' | awk '{print $1}'")
         rx = int(open(f"/sys/class/net/{iface}/statistics/rx_bytes").read().strip())
         tx = int(open(f"/sys/class/net/{iface}/statistics/tx_bytes").read().strip())
-        return round((rx + tx) / (1024**3), 2)
+        return rx, tx
     except:
-        return 0.0
+        return 0, 0
+
+def format_speed(bps):
+    if bps < 1024:
+        return f"{int(bps)} B/s"
+    elif bps < 1024 * 1024:
+        return f"{round(bps / 1024, 1)} KB/s"
+    else:
+        return f"{round(bps / (1024 * 1024), 2)} MB/s"
 
 class DashboardHandler(http.server.SimpleHTTPRequestHandler):
     def do_GET(self):
         if self.path == '/config.yaml':
             super().do_GET()
         elif self.path == '/api/data':
-            global LAST_ACTIVE_TIME
+            global LAST_ACTIVE_TIME, LAST_NET_TIME, LAST_RX, LAST_TX
             current_time = time.time()
             
             self.send_response(200)
@@ -388,21 +401,13 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                     max_delta = delta
                     best_ip = ip
                     
-            # ---------------------------------------------------------
-            # THE HUMAN TRAFFIC THRESHOLD (The Core Fix)
-            # ---------------------------------------------------------
-            # Clash health checks are ~500 bytes. 
-            # If the VPS sees more than 5,000 bytes (5KB) of movement, 
-            # we confidently know TUN mode is routing REAL traffic.
             if total_delta > 5000:
                 LAST_ACTIVE_TIME = current_time
                 
-            # If 30 seconds pass without breaching 5KB of traffic, 
-            # assume the user turned off TUN mode or went completely idle.
             is_client_online = (current_time - LAST_ACTIVE_TIME) < 30
             
             if not is_client_online:
-                history = {} # Purge everything
+                history = {}
                 if os.path.exists(HISTORY_FILE):
                     try: os.remove(HISTORY_FILE)
                     except: pass
@@ -424,10 +429,23 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 with open(HISTORY_FILE, "w") as f:
                     f.write(json.dumps(history))
             
+            # --- System Metrics & Speed Engine ---
             cpu_pct = get_cpu_usage()
             ram_pct, ram_str = get_ram_usage()
             disk_pct, disk_str = get_disk_usage()
-            total_traffic = get_total_traffic()
+            
+            rx, tx = get_net_stats()
+            if LAST_RX == 0 and LAST_TX == 0:
+                LAST_RX, LAST_TX = rx, tx
+            
+            time_diff = current_time - LAST_NET_TIME
+            rx_speed = (rx - LAST_RX) / time_diff if time_diff > 0 else 0
+            tx_speed = (tx - LAST_TX) / time_diff if time_diff > 0 else 0
+            
+            LAST_RX, LAST_TX = rx, tx
+            LAST_NET_TIME = current_time
+            
+            total_traffic = round((rx + tx) / (1024**3), 2)
 
             payload = {
                 "cpu_pct": cpu_pct,
@@ -436,6 +454,8 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 "disk_pct": disk_pct,
                 "disk_str": disk_str,
                 "total_traffic": total_traffic,
+                "dl_speed": format_speed(rx_speed),
+                "ul_speed": format_speed(tx_speed),
                 "is_client_online": is_client_online,
                 "isps": list(history.values())
             }
@@ -469,6 +489,11 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
         .m-val-row { display: flex; justify-content: space-between; align-items: baseline; margin: 4px 0 6px 0; }
         .m-val { font-size: 20px; font-weight: 800; font-family: monospace; color: #F8FAFC; }
         .m-sub { font-size: 11px; color: #64748B; font-family: monospace; }
+        
+        .speed-row { display: flex; justify-content: space-between; font-size: 11px; font-family: monospace; margin-bottom: 4px; }
+        .dl-text { color: #10B981; font-weight: 700; }
+        .ul-text { color: #38BDF8; font-weight: 700; }
+
         .p-bg { background: #0B0F19; height: 6px; border-radius: 3px; overflow: hidden; }
         .p-fill { height: 100%; border-radius: 3px; transition: width 0.4s ease; }
         .f-cpu { background: #38BDF8; }
@@ -525,8 +550,12 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 <div class="p-bg"><div id="disk-bar" class="p-fill f-disk" style="width: 0%;"></div></div>
             </div>
             <div class="m-card">
-                <div class="m-title">Total VPS Bandwidth</div>
-                <div class="m-val-row"><span id="traffic-val" class="m-val">0.0 GB</span><span class="m-sub">In / Out</span></div>
+                <div class="m-title">VPS Traffic & Speed</div>
+                <div class="m-val-row" style="margin-bottom:2px;"><span id="traffic-val" class="m-val">0.0 GB</span><span class="m-sub">Total</span></div>
+                <div class="speed-row">
+                    <span>↓ <span id="dl-speed" class="dl-text">0.0 KB/s</span></span>
+                    <span>↑ <span id="ul-speed" class="ul-text">0.0 KB/s</span></span>
+                </div>
                 <div class="p-bg"><div class="p-fill f-traffic" style="width: 100%;"></div></div>
             </div>
         </div>
@@ -553,7 +582,10 @@ class DashboardHandler(http.server.SimpleHTTPRequestHandler):
                 document.getElementById('disk-sub').innerText = d.disk_str;
                 document.getElementById('disk-bar').style.width = Math.min(d.disk_pct, 100) + '%';
 
+                // Speed Metrics applied
                 document.getElementById('traffic-val').innerText = d.total_traffic + ' GB';
+                document.getElementById('dl-speed').innerText = d.dl_speed;
+                document.getElementById('ul-speed').innerText = d.ul_speed;
 
                 const sb = document.getElementById('status-badge');
                 if (d.is_client_online) {
